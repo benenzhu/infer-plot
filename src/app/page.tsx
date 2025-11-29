@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef, Suspense } from 'react';
+import { useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { BenchmarkResult, FilterState } from '@/lib/types';
 import MultiSelect from '@/components/MultiSelect';
 import TimeSeriesChart from '@/components/TimeSeriesChart';
@@ -21,25 +22,105 @@ const WORKFLOWS = [
   { label: '8k/1k', value: 'full-sweep-8k1k-scheduler.yml' },
 ];
 
-export default function Dashboard() {
+// Helper to parse array from URL param
+function parseArrayParam(param: string | null): string[] {
+  if (!param) return [];
+  return param.split(',').filter(Boolean);
+}
+
+// Helper to encode array to URL param
+function encodeArrayParam(arr: string[]): string | null {
+  if (arr.length === 0) return null;
+  return arr.join(',');
+}
+
+// Main page component with Suspense wrapper
+export default function Page() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen bg-[#1a1a1a] flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+          <p className="text-gray-400">Loading...</p>
+        </div>
+      </div>
+    }>
+      <Dashboard />
+    </Suspense>
+  );
+}
+
+function Dashboard() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  
   const [benchmarkData, setBenchmarkData] = useState<BenchmarkResult[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [runsCount, setRunsCount] = useState(0);
   const [cacheInfo, setCacheInfo] = useState<{ cached: boolean; cacheAge?: number } | null>(null);
 
-  const [filters, setFilters] = useState<FilterState>({
-    model: [],
-    hardware: [],
-    framework: [],
-    precision: [],
-    tp: [],
-    concurrency: [],
+  // Initialize state from URL params
+  const getInitialFilters = useCallback((): FilterState => ({
+    model: parseArrayParam(searchParams.get('model')),
+    hardware: parseArrayParam(searchParams.get('hardware')),
+    framework: parseArrayParam(searchParams.get('framework')),
+    precision: parseArrayParam(searchParams.get('precision')),
+    tp: parseArrayParam(searchParams.get('tp')),
+    concurrency: parseArrayParam(searchParams.get('concurrency')),
+  }), [searchParams]);
+
+  const [filters, setFilters] = useState<FilterState>(getInitialFilters);
+
+  const [dateRange, setDateRange] = useState(() => {
+    const days = searchParams.get('days');
+    return days ? parseInt(days) : 365;
+  });
+  
+  const [workflow, setWorkflow] = useState(() => {
+    return searchParams.get('workflow') || 'full-sweep-1k1k-scheduler.yml';
+  });
+  
+  const [granularity, setGranularity] = useState<'day' | 'commit'>(() => {
+    const g = searchParams.get('granularity');
+    return g === 'commit' ? 'commit' : 'day';
   });
 
-  const [dateRange, setDateRange] = useState(365);
-  const [workflow, setWorkflow] = useState('full-sweep-1k1k-scheduler.yml');
-  const [granularity, setGranularity] = useState<'day' | 'commit'>('day');
+  // Update URL when state changes
+  const updateURL = useCallback((newFilters: FilterState, newDateRange: number, newWorkflow: string, newGranularity: 'day' | 'commit') => {
+    const params = new URLSearchParams();
+    
+    // Add workflow if not default
+    if (newWorkflow !== 'full-sweep-1k1k-scheduler.yml') {
+      params.set('workflow', newWorkflow);
+    }
+    
+    // Add date range if not default
+    if (newDateRange !== 365) {
+      params.set('days', String(newDateRange));
+    }
+    
+    // Add granularity if not default
+    if (newGranularity !== 'day') {
+      params.set('granularity', newGranularity);
+    }
+    
+    // Add filters
+    const filterKeys: (keyof FilterState)[] = ['model', 'hardware', 'framework', 'precision', 'tp', 'concurrency'];
+    for (const key of filterKeys) {
+      const encoded = encodeArrayParam(newFilters[key]);
+      if (encoded) {
+        params.set(key, encoded);
+      }
+    }
+    
+    const queryString = params.toString();
+    const newURL = queryString ? `${pathname}?${queryString}` : pathname;
+    
+    // Use replaceState to avoid adding to browser history for every change
+    router.replace(newURL, { scroll: false });
+  }, [pathname, router]);
 
   // Track current fetch to prevent duplicates
   const fetchKeyRef = useRef<string | null>(null);
@@ -173,22 +254,55 @@ export default function Dashboard() {
   }, [filteredData, runsCount]);
 
   const updateFilter = (key: keyof FilterState, values: string[]) => {
-    setFilters(prev => ({ ...prev, [key]: values }));
+    const newFilters = { ...filters, [key]: values };
+    setFilters(newFilters);
+    updateURL(newFilters, dateRange, workflow, granularity);
   };
 
   const clearFilters = () => {
-    setFilters({
+    const newFilters = {
       model: [],
       hardware: [],
       framework: [],
       precision: [],
       tp: [],
       concurrency: [],
-    });
+    };
+    setFilters(newFilters);
+    updateURL(newFilters, dateRange, workflow, granularity);
+  };
+  
+  // Wrappers to update URL when changing other states
+  const handleDateRangeChange = (days: number) => {
+    setDateRange(days);
+    updateURL(filters, days, workflow, granularity);
+  };
+  
+  const handleWorkflowChange = (w: string) => {
+    setWorkflow(w);
+    updateURL(filters, dateRange, w, granularity);
+  };
+  
+  const handleGranularityChange = (g: 'day' | 'commit') => {
+    setGranularity(g);
+    updateURL(filters, dateRange, workflow, g);
   };
 
   // Count active filters
   const activeFilterCount = Object.values(filters).filter(arr => arr.length > 0).length;
+  
+  // Copy link state
+  const [copied, setCopied] = useState(false);
+  
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#1a1a1a]">
@@ -203,6 +317,30 @@ export default function Dashboard() {
               </span>
             </div>
             <div className="flex items-center gap-4 text-sm">
+              <button
+                onClick={copyLink}
+                className={`px-3 py-1 rounded transition-colors flex items-center gap-1.5 ${
+                  copied 
+                    ? 'bg-green-600/20 text-green-400 border border-green-600/50' 
+                    : 'bg-[#333] text-gray-400 hover:bg-[#444] hover:text-white'
+                }`}
+              >
+                {copied ? (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                    </svg>
+                    Copied!
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                    Share Link
+                  </>
+                )}
+              </button>
               <a 
                 href="https://github.com/InferenceMAX/InferenceMAX"
                 target="_blank"
@@ -257,7 +395,7 @@ export default function Dashboard() {
                 {WORKFLOWS.map(w => (
                   <button
                     key={w.value}
-                    onClick={() => setWorkflow(w.value)}
+                    onClick={() => handleWorkflowChange(w.value)}
                     className={`px-3 py-1.5 text-xs rounded transition-colors ${
                       workflow === w.value
                         ? 'bg-blue-600 text-white'
@@ -277,7 +415,7 @@ export default function Dashboard() {
                 {DATE_RANGES.map(range => (
                   <button
                     key={range.days}
-                    onClick={() => setDateRange(range.days)}
+                    onClick={() => handleDateRangeChange(range.days)}
                     className={`px-3 py-1.5 text-xs rounded transition-colors ${
                       dateRange === range.days
                         ? 'bg-blue-600 text-white'
@@ -295,7 +433,7 @@ export default function Dashboard() {
               <label className="text-xs text-gray-500">Granularity</label>
               <div className="flex gap-1">
                 <button
-                  onClick={() => setGranularity('day')}
+                  onClick={() => handleGranularityChange('day')}
                   className={`px-3 py-1.5 text-xs rounded transition-colors ${
                     granularity === 'day'
                       ? 'bg-blue-600 text-white'
@@ -305,7 +443,7 @@ export default function Dashboard() {
                   Day
                 </button>
                 <button
-                  onClick={() => setGranularity('commit')}
+                  onClick={() => handleGranularityChange('commit')}
                   className={`px-3 py-1.5 text-xs rounded transition-colors ${
                     granularity === 'commit'
                       ? 'bg-blue-600 text-white'
